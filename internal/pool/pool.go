@@ -412,6 +412,7 @@ func (p *ConnPool) removeConn(cn *Conn) {
 }
 
 func (p *ConnPool) closeConn(cn *Conn) error {
+	internal.Logger.Printf(context.TODO(), "close conn:%s\n", cn.RemoteAddr())
 	return cn.Close()
 }
 

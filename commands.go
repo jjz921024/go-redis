@@ -504,6 +504,65 @@ type Cmdable interface {
 	ACLLogReset(ctx context.Context) *StatusCmd
 
 	ModuleLoadex(ctx context.Context, conf *ModuleLoadexConfig) *StringCmd
+
+	// TairString
+	Cas(ctx context.Context, key string, oldVal, newVal interface{}) *IntCmd
+	CasArgs(ctx context.Context, key string, oldVal, newVal interface{}, a *SetArgs) *IntCmd
+	Cad(ctx context.Context, key string, value interface{}) *IntCmd
+	ExSet(ctx context.Context, key string, value interface{}) *StatusCmd
+	ExSetArgs(ctx context.Context, key string, value interface{}, a *ExSetArgs) *StatusCmd
+	ExSetWithVersion(ctx context.Context, key string, value interface{}, a *ExSetArgs) *IntCmd
+	ExSetVer(ctx context.Context, key string, version int64) *IntCmd
+	ExGet(ctx context.Context, key string) *SliceCmd
+	ExIncrBy(ctx context.Context, key string, incr int64) *IntCmd
+	ExIncrByArgs(ctx context.Context, key string, incr int64, a *ExIncrByArgs) *IntCmd
+	ExIncrByWithVersion(ctx context.Context, key string, incr int64, a *ExIncrByArgs) *SliceCmd
+	ExIncrByFloat(ctx context.Context, key string, incr float64) *FloatCmd
+	ExIncrByFloatArgs(ctx context.Context, key string, incr float64, a *ExIncrByArgs) *FloatCmd
+	ExCas(ctx context.Context, key string, newVal interface{}, version int64) *SliceCmd
+	ExCad(ctx context.Context, key string, version int) *IntCmd
+	ExAppend(ctx context.Context, key string, value interface{}, nxxx, verAbs string, version int64) *IntCmd
+	ExPreAppend(ctx context.Context, key string, value interface{}, nxxx, verAbs string, version int64) *IntCmd
+	ExGae(ctx context.Context, key string, time time.Duration) *SliceCmd
+
+	// TairHash
+	ExHSet(ctx context.Context, key, field, value string) *IntCmd
+	ExHSetArgs(ctx context.Context, key, field, value string, a *ExSetArgs) *IntCmd
+	ExHSetNx(ctx context.Context, key, field, value string) *IntCmd
+	ExHMSet(ctx context.Context, key string, fieldValue map[string]string) *StatusCmd
+	ExHGet(ctx context.Context, key, field string) *StringCmd
+	ExHPExpire(ctx context.Context, key, field string, milliseconds int) *BoolCmd
+	ExHPExpireAt(ctx context.Context, key, field string, unixTime int) *BoolCmd
+	ExHExpire(ctx context.Context, key, field string, milliseconds int) *BoolCmd
+	ExHExpireAt(ctx context.Context, key, field string, unixTime int) *BoolCmd
+	ExHPTTL(ctx context.Context, key, field string) *IntCmd
+	ExHTTL(ctx context.Context, key, field string) *IntCmd
+	ExHVer(ctx context.Context, key, field string) *IntCmd
+	ExHSetVer(ctx context.Context, key, field string, version int) *BoolCmd
+	ExHIncrBy(ctx context.Context, key, field string, value int) *IntCmd
+	ExHIncrByArgs(ctx context.Context, key, field string, value int, a *ExHIncrArgs) *IntCmd
+	ExHIncrByFloat(ctx context.Context, key, field string, value float64) *StringCmd
+	ExHIncrByFloatArgs(ctx context.Context, key, field string, value float64, a *ExHIncrArgs) *StringCmd
+	ExHGetWithVer(ctx context.Context, key, field string) *SliceCmd
+	ExHMGet(ctx context.Context, key string, field ...string) *StringSliceCmd
+	ExHMGetWithVer(ctx context.Context, key string, field ...string) *SliceCmd
+	ExHDel(ctx context.Context, key string, field ...string) *IntCmd
+	ExHLen(ctx context.Context, key string) *IntCmd
+	ExHExists(ctx context.Context, key, field string) *BoolCmd
+	ExHStrLen(ctx context.Context, key, field string) *IntCmd
+	ExHKeys(ctx context.Context, key string) *StringSliceCmd
+	ExHVals(ctx context.Context, key string) *StringSliceCmd
+	ExHGetAll(ctx context.Context, key string) *MapStringStringCmd
+	ExHScan(ctx context.Context, key string, cursor string) *SliceCmd
+
+	BfReserve(ctx context.Context, key string, errorRate float64, capacity int) *StatusCmd;
+	BfAdd(ctx context.Context, key string, element interface{}) *IntCmd
+	BfMAdd(ctx context.Context, key string, elements ...interface{}) *IntSliceCmd
+	BfInsert(ctx context.Context, key string, errorRate float64, capacity int, elements ...interface{}) *IntSliceCmd
+	BfExists(ctx context.Context, key string, element interface{}) *IntCmd
+	BfMExists(ctx context.Context, key string, elements ...interface{}) *IntSliceCmd
+	BfDel(ctx context.Context, key string) *IntCmd
+	BfInfo(ctx context.Context, key string) *SliceCmd
 }
 
 type StatefulCmdable interface {

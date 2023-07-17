@@ -95,6 +95,8 @@ func isBadConn(err error, allowTimeout bool, addr string) bool {
 			// of the connection. Force a DNS resolution when all connections
 			// of the pool are recycled
 			return true
+		case isTpsLimitError(err):
+			return false
 		default:
 			return false
 		}
@@ -108,6 +110,17 @@ func isBadConn(err error, allowTimeout bool, addr string) bool {
 
 	return true
 }
+
+func shouldBeEvict(cn *pool.Conn, aliveProxy []string) bool {
+	c := cn.RemoteAddr().String()
+	for _, v := range aliveProxy {
+		if c == v {
+			return false
+		}
+	}
+	return true
+}
+
 
 func isMovedError(err error) (moved bool, ask bool, addr string) {
 	if !isRedisError(err) {
@@ -146,6 +159,10 @@ func isMovedSameConnAddr(err error, addr string) bool {
 		return false
 	}
 	return strings.HasSuffix(redisError, " "+addr)
+}
+
+func isTpsLimitError(err error) bool {
+	return strings.Contains(err.Error(), "handle tps exceed")
 }
 
 //------------------------------------------------------------------------------

@@ -7,4 +7,6 @@ require (
 	github.com/bsm/gomega v1.26.0
 	github.com/cespare/xxhash/v2 v2.2.0
 	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f
+	github.com/wenzhenxi/gorsa v0.0.0-20230530123828-0320cce15d81
+	golang.org/x/sync v0.3.0
 )

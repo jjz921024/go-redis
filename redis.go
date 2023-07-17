@@ -187,6 +187,8 @@ type baseClient struct {
 	connPool pool.Pooler
 
 	onClose func() error // hook called when client is closed
+
+	closeCh chan struct{}
 }
 
 func (c *baseClient) clone() *baseClient {
@@ -338,7 +340,7 @@ func (c *baseClient) releaseConn(ctx context.Context, cn *pool.Conn, err error) 
 		c.opt.Limiter.ReportResult(err)
 	}
 
-	if isBadConn(err, false, c.opt.Addr) {
+	if (ob != nil && shouldBeEvict(cn, ob.currentProxy)) || isBadConn(err, false, c.opt.Addr) {
 		c.connPool.Remove(ctx, cn, err)
 	} else {
 		c.connPool.Put(ctx, cn)
@@ -445,6 +447,10 @@ func (c *baseClient) Close() error {
 	if err := c.connPool.Close(); err != nil && firstErr == nil {
 		firstErr = err
 	}
+	if ob != nil {
+		ob.close()
+	}
+	close(c.closeCh)
 	return firstErr
 }
 
@@ -618,6 +624,39 @@ func NewClient(opt *Options) *Client {
 	return &c
 }
 
+func NewProxyClient(opt *Options) (*Client, error) {
+	err := opt.checkProxyOption()
+	if err != nil {
+		return nil, err
+	}
+
+	opt.init()
+
+	var observer *observer = nil
+	if !opt.ObserverDisable {
+		observer = getObserver(opt.ObserverDomain, opt.ClusterName, opt.ReadTimeout)
+		observer.start()
+	}
+
+	c := Client{
+		baseClient: &baseClient{
+			opt:     opt,
+			closeCh: make(chan struct{}),
+		},
+	}
+	c.init()
+
+	if opt.ObserverDisable {
+		c.connPool = newConnPoolFromInitServer(opt, opt.InitServers, c.dialHook)
+	} else {
+		c.connPool = newConnPoolFromObserver(opt, observer, c.dialHook)
+		t := time.NewTicker(20 * time.Second)
+		go startEvictInvaildConn(t, c.connPool, c.closeCh)
+	}
+
+	return &c, nil
+}
+
 func (c *Client) init() {
 	c.cmdable = c.Process
 	c.initHooks(hooks{
@@ -626,6 +665,33 @@ func (c *Client) init() {
 		pipeline:   c.baseClient.processPipeline,
 		txPipeline: c.baseClient.processTxPipeline,
 	})
+}
+
+func startEvictInvaildConn(t *time.Ticker, pool pool.Pooler, closeCh chan struct{}) {
+	ctx := context.TODO()
+	internal.Logger.Printf(ctx, "start goroutine for evict invalid conn")
+	for {
+		select {
+		case _, ok := <-closeCh:
+			if !ok {
+				internal.Logger.Printf(ctx, "exit evict conn goroutine\n")
+				return
+			}
+		case <-t.C:
+			c, err := pool.Get(ctx)
+			if err != nil {
+				internal.Logger.Printf(ctx, "fail to check connection, err:%s\n", err.Error())
+				continue
+			}
+			internal.Logger.Printf(ctx, "check connection:%s\n", c.RemoteAddr())
+
+			if shouldBeEvict(c, ob.currentProxy) {
+				pool.Remove(ctx, c, errors.New("connection is invalid"))
+			} else {
+				pool.Put(ctx, c)
+			}
+		}
+	}
 }
 
 func (c *Client) WithTimeout(timeout time.Duration) *Client {
@@ -706,6 +772,32 @@ func (c *Client) pubSub() *PubSub {
 	return pubsub
 }
 
+func (c *Client) proxyPubSub() *ProxyPubSub {
+	pubsub := &ProxyPubSub{
+		opt: c.opt,
+
+		newConn: func(ctx context.Context, addr string, channels []string) (*pool.Conn, error) {
+			netConn, err := c.dial(ctx, "tcp", addr)
+			if err != nil {
+				return nil, errors.New("fail subscribe proxy addr:" + addr)
+			}
+			cn := pool.NewConn(netConn)
+			err = c.initConn(ctx, cn)
+			if err != nil {
+				return nil, errors.New("fail init subscribe conn, err:" + err.Error())
+			}
+			internal.Logger.Printf(ctx, "create connection:%s for subscribe", addr)
+			return cn, nil
+		},
+		closeConn: func(cn *pool.Conn) error {
+			internal.Logger.Printf(context.TODO(), "close subscribe conn:%s\n", cn.RemoteAddr())
+			return cn.Close()
+		},
+	}
+	pubsub.init()
+	return pubsub
+}
+
 // Subscribe subscribes the client to the specified channels.
 // Channels can be omitted to create empty subscription.
 // Note that this method does not wait on a response from Redis, so the
@@ -756,6 +848,22 @@ func (c *Client) SSubscribe(ctx context.Context, channels ...string) *PubSub {
 	pubsub := c.pubSub()
 	if len(channels) > 0 {
 		_ = pubsub.SSubscribe(ctx, channels...)
+	}
+	return pubsub
+}
+
+func (c *Client) SubscribeAllProxy(ctx context.Context, channels ...string) *ProxyPubSub {
+	pubsub := c.proxyPubSub()
+	if len(channels) > 0 {
+		_ = pubsub.Subscribe(ctx, channels...)
+	}
+	return pubsub
+}
+
+func (c *Client) PSubscribeAllProxy(ctx context.Context, channels ...string) *ProxyPubSub {
+	pubsub := c.proxyPubSub()
+	if len(channels) > 0 {
+		_ = pubsub.PSubscribe(ctx, channels...)
 	}
 	return pubsub
 }

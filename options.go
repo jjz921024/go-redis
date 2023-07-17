@@ -5,14 +5,18 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"math/rand"
 	"net"
 	"net/url"
+	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/redis/go-redis/v9/internal"
 	"github.com/redis/go-redis/v9/internal/pool"
 )
 
@@ -29,6 +33,23 @@ type Limiter interface {
 
 // Options keeps the settings to set up redis connection.
 type Options struct {
+	// for proxy
+	ClusterName string
+
+	ObserverDomain string
+
+	AompPubFile string
+	AompPubKey  string
+
+	AppPrvFile string
+	AppPrvKey  string
+
+	ProxyPubFile string
+	ProxyPubKey  string
+
+	ObserverDisable bool
+	InitServers     []string
+
 	// The network type, either tcp or unix.
 	// Default is tcp.
 	Network string
@@ -207,6 +228,82 @@ func (opt *Options) init() {
 func (opt *Options) clone() *Options {
 	clone := *opt
 	return &clone
+}
+
+func (opt *Options) checkProxyOption() error {
+	if opt.ClusterName == "" {
+		return errors.New("ClusterName can't be null")
+	}
+	if opt.ObserverDomain == "" {
+		return errors.New("ObserverDomain can't be null")
+	}
+	if opt.ObserverDisable && len(opt.InitServers) == 0 {
+		return errors.New("InitServers is empty when bypass observer")
+	}
+
+	if opt.Username == "" || opt.Password == "" {
+		return errors.New("UserName or Password can't be null")
+	}
+
+	aompPubKey, err := extractKey(opt.AompPubKey, opt.AompPubFile)
+	if err != nil {
+		return errors.New("can't parse aomp public key")
+	}
+	appPrvKey, err := extractKey(opt.AppPrvKey, opt.AppPrvFile)
+	if err != nil {
+		return errors.New("app private key can't be null")
+	}
+	proxyPubKey, err := extractKey(opt.ProxyPubKey, opt.ProxyPubFile)
+	if err != nil {
+		return errors.New("proxy public key can't be null")
+	}
+
+	// 解密得到明文密码
+	prefix := "{RSA}"
+	pwd := opt.Password
+	if strings.HasPrefix(pwd, prefix) {
+		pwd = strings.TrimPrefix(pwd, prefix)
+		tmp, err := pubKeyDecrypt(pwd, aompPubKey)
+		if err != nil {
+			return err
+		}
+		tmp, err = priKeyDecrypt(tmp, appPrvKey)
+		if err != nil {
+			return err
+		}
+		pwd = string(tmp)
+	}
+
+	// proxy公钥加密传输
+	encryptPwd, err := publicKeyEncrypt(pwd, proxyPubKey)
+	if err != nil {
+		return err
+	}
+
+	// TODO:
+	opt.Password = opt.Username + "|||" + prefix + encryptPwd + "@@@Golang@@@1.0.0"
+	opt.Password = "wb6Cluster"
+	opt.Username = ""
+	return nil
+}
+
+func extractKey(key, file string) (string, error) {
+	dir, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	result := key
+	if result == "" || file != "" {
+		key, err := os.ReadFile(filepath.Join(dir, file))
+		if err != nil {
+			return "", err
+		}
+		result = string(key)
+	}
+	if result == "" {
+		return "", errors.New("can't parse key")
+	}
+	return result, nil
 }
 
 // NewDialer returns a function that will be used as the default dialer
@@ -493,6 +590,54 @@ func newConnPool(
 	return pool.NewConnPool(&pool.Options{
 		Dialer: func(ctx context.Context) (net.Conn, error) {
 			return dialer(ctx, opt.Network, opt.Addr)
+		},
+		PoolFIFO:        opt.PoolFIFO,
+		PoolSize:        opt.PoolSize,
+		PoolTimeout:     opt.PoolTimeout,
+		MinIdleConns:    opt.MinIdleConns,
+		MaxIdleConns:    opt.MaxIdleConns,
+		ConnMaxIdleTime: opt.ConnMaxIdleTime,
+		ConnMaxLifetime: opt.ConnMaxLifetime,
+	})
+}
+
+func newConnPoolFromObserver(
+	opt *Options, ob *observer,
+	dialer func(ctx context.Context, network, addr string) (net.Conn, error),
+) *pool.ConnPool {
+	return pool.NewConnPool(&pool.Options{
+		Dialer: func(ctx context.Context) (net.Conn, error) {
+			proxy := ob.getCurrentProxyList()
+			num := len(proxy)
+			if num <= 0 {
+				return nil, errors.New("currnet proxy list is empty")
+			}
+			addr := proxy[rand.Intn(num)]
+			internal.Logger.Printf(context.TODO(), "connect to %s\n", addr)
+			return dialer(ctx, "tcp", addr)
+		},
+		PoolFIFO:        opt.PoolFIFO,
+		PoolSize:        opt.PoolSize,
+		PoolTimeout:     opt.PoolTimeout,
+		MinIdleConns:    opt.MinIdleConns,
+		MaxIdleConns:    opt.MaxIdleConns,
+		ConnMaxIdleTime: opt.ConnMaxIdleTime,
+		ConnMaxLifetime: opt.ConnMaxLifetime,
+	})
+}
+
+func newConnPoolFromInitServer(opt *Options, servers []string,
+	dialer func(ctx context.Context, network, addr string) (net.Conn, error),
+) *pool.ConnPool {
+	return pool.NewConnPool(&pool.Options{
+		Dialer: func(ctx context.Context) (net.Conn, error) {
+			num := len(servers)
+			if num <= 0 {
+				return nil, errors.New("currnet proxy list is empty")
+			}
+			addr := servers[rand.Intn(num)]
+			internal.Logger.Printf(context.TODO(), "connect to %s\n", addr)
+			return dialer(ctx, "tcp", addr)
 		},
 		PoolFIFO:        opt.PoolFIFO,
 		PoolSize:        opt.PoolSize,

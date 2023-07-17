@@ -2,7 +2,9 @@ package redis
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -10,86 +12,107 @@ import (
 	"github.com/redis/go-redis/v9/internal"
 	"github.com/redis/go-redis/v9/internal/pool"
 	"github.com/redis/go-redis/v9/internal/proto"
+	"golang.org/x/sync/errgroup"
 )
 
-// PubSub implements Pub/Sub commands as described in
-// http://redis.io/topics/pubsub. Message receiving is NOT safe
-// for concurrent use by multiple goroutines.
-//
-// PubSub automatically reconnects to Redis Server and resubscribes
-// to the channels in case of network errors.
-type PubSub struct {
+type ProxyPubSub struct {
 	opt *Options
 
-	newConn   func(ctx context.Context, channels []string) (*pool.Conn, error)
-	closeConn func(*pool.Conn) error
+	// 创建到某一实例的非池化连接
+	newConn   func(ctx context.Context, addr string, channels []string) (*pool.Conn, error)
+	closeConn func(cn *pool.Conn) error
 
-	mu        sync.Mutex
-	cn        *pool.Conn
-	channels  map[string]struct{}
-	patterns  map[string]struct{}
-	schannels map[string]struct{}
+	mu  sync.Mutex
+	cns map[string]*pool.Conn
+
+	channels map[string]struct{}
+	patterns map[string]struct{}
 
 	closed bool
 	exit   chan struct{}
 
 	cmd *Cmd
 
+	notifyCh    chan interface{}
+	inSubscribe map[*pool.Conn]struct{}
+
 	chOnce sync.Once
 	msgCh  *channel
 	allCh  *channel
 }
 
-func (c *PubSub) init() {
+func (c *ProxyPubSub) init() {
 	c.exit = make(chan struct{})
+	c.cns = make(map[string]*pool.Conn)
+	c.notifyCh = make(chan interface{})
+	c.inSubscribe = make(map[*pool.Conn]struct{})
 }
 
-func (c *PubSub) String() string {
+func (c *ProxyPubSub) String() string {
 	channels := mapKeys(c.channels)
 	channels = append(channels, mapKeys(c.patterns)...)
-	channels = append(channels, mapKeys(c.schannels)...)
-	return fmt.Sprintf("PubSub(%s)", strings.Join(channels, ", "))
+	return fmt.Sprintf("ProxyPubSub(%s)", strings.Join(channels, ", "))
 }
 
-func (c *PubSub) connWithLock(ctx context.Context) (*pool.Conn, error) {
+func (c *ProxyPubSub) connWithLock(ctx context.Context) (map[string]*pool.Conn, error) {
 	c.mu.Lock()
 	cn, err := c.conn(ctx, nil)
 	c.mu.Unlock()
 	return cn, err
 }
 
-func (c *PubSub) conn(ctx context.Context, newChannels []string) (*pool.Conn, error) {
+// 对每个proxy实例返回一个连接
+// 会对新增的proxy实例建连 和 断开下线的proxy实例
+func (c *ProxyPubSub) conn(ctx context.Context, newChannels []string) (map[string]*pool.Conn, error) {
 	if c.closed {
 		return nil, pool.ErrClosed
 	}
-	if c.cn != nil {
-		return c.cn, nil
+
+	var currentProxy []string
+	if c.opt.ObserverDisable {
+		currentProxy = c.opt.InitServers
+	} else {
+		currentProxy = ob.getCurrentProxyList()
 	}
 
-	channels := mapKeys(c.channels)
-	channels = append(channels, newChannels...)
-
-	cn, err := c.newConn(ctx, channels)
-	if err != nil {
-		return nil, err
+	// 移除下线proxy的连接
+	for addr, cn := range c.cns {
+		if exist := contains(currentProxy, addr); !exist {
+			delete(c.inSubscribe, cn)
+			_ = c.closeConn(cn)
+		}
 	}
 
-	if err := c.resubscribe(ctx, cn); err != nil {
-		_ = c.closeConn(cn)
-		return nil, err
+	// 新建到该proxy的连接
+	for _, addr := range currentProxy {
+		if _, exist := c.cns[addr]; !exist {
+			cn, err := c.newConn(ctx, addr, newChannels)
+			if err != nil {
+				return nil, err
+			}
+
+			if err := c.resubscribe(ctx, cn); err != nil {
+				_ = c.closeConn(cn)
+				return nil, err
+			}
+			c.cns[addr] = cn
+		}
 	}
 
-	c.cn = cn
-	return cn, nil
+	if len(c.cns) <= 0 {
+		return nil, errors.New("not proxy for subscribe")
+	}
+
+	return c.cns, nil
 }
 
-func (c *PubSub) writeCmd(ctx context.Context, cn *pool.Conn, cmd Cmder) error {
+func (c *ProxyPubSub) writeCmd(ctx context.Context, cn *pool.Conn, cmd Cmder) error {
 	return cn.WithWriter(context.Background(), c.opt.WriteTimeout, func(wr *proto.Writer) error {
 		return writeCmd(wr, cmd)
 	})
 }
 
-func (c *PubSub) resubscribe(ctx context.Context, cn *pool.Conn) error {
+func (c *ProxyPubSub) resubscribe(ctx context.Context, cn *pool.Conn) error {
 	var firstErr error
 
 	if len(c.channels) > 0 {
@@ -103,27 +126,10 @@ func (c *PubSub) resubscribe(ctx context.Context, cn *pool.Conn) error {
 		}
 	}
 
-	if len(c.schannels) > 0 {
-		err := c._subscribe(ctx, cn, "ssubscribe", mapKeys(c.schannels))
-		if err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-
 	return firstErr
 }
 
-func mapKeys(m map[string]struct{}) []string {
-	s := make([]string, len(m))
-	i := 0
-	for k := range m {
-		s[i] = k
-		i++
-	}
-	return s
-}
-
-func (c *PubSub) _subscribe(
+func (c *ProxyPubSub) _subscribe(
 	ctx context.Context, cn *pool.Conn, redisCmd string, channels []string,
 ) error {
 	args := make([]interface{}, 0, 1+len(channels))
@@ -135,44 +141,27 @@ func (c *PubSub) _subscribe(
 	return c.writeCmd(ctx, cn, cmd)
 }
 
-func (c *PubSub) releaseConnWithLock(
-	ctx context.Context,
-	cn *pool.Conn,
-	err error,
-	allowTimeout bool,
-) {
-	c.mu.Lock()
-	c.releaseConn(ctx, cn, err, allowTimeout)
-	c.mu.Unlock()
-}
-
-func (c *PubSub) releaseConn(ctx context.Context, cn *pool.Conn, err error, allowTimeout bool) {
-	if c.cn != cn {
-		return
-	}
-	if isBadConn(err, allowTimeout, c.opt.Addr) {
-		c.reconnect(ctx, err)
-	}
-}
-
-func (c *PubSub) reconnect(ctx context.Context, reason error) {
-	_ = c.closeTheCn(reason)
-	_, _ = c.conn(ctx, nil)
-}
-
-func (c *PubSub) closeTheCn(reason error) error {
-	if c.cn == nil {
+func (c *ProxyPubSub) closeTheCn(reason error) error {
+	if len(c.cns) == 0 {
 		return nil
 	}
 	if !c.closed {
 		internal.Logger.Printf(c.getContext(), "redis: discarding bad PubSub connection: %s", reason)
 	}
-	err := c.closeConn(c.cn)
-	c.cn = nil
-	return err
+
+	for _, cn := range c.cns {
+		if err := c.closeConn(cn); err != nil {
+			return err
+		}
+	}
+
+	for k := range c.cns {
+		delete(c.cns, k)
+	}
+	return nil
 }
 
-func (c *PubSub) Close() error {
+func (c *ProxyPubSub) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -187,7 +176,7 @@ func (c *PubSub) Close() error {
 
 // Subscribe the client to the specified channels. It returns
 // empty subscription if there are no channels.
-func (c *PubSub) Subscribe(ctx context.Context, channels ...string) error {
+func (c *ProxyPubSub) Subscribe(ctx context.Context, channels ...string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -203,7 +192,7 @@ func (c *PubSub) Subscribe(ctx context.Context, channels ...string) error {
 
 // PSubscribe the client to the given patterns. It returns
 // empty subscription if there are no patterns.
-func (c *PubSub) PSubscribe(ctx context.Context, patterns ...string) error {
+func (c *ProxyPubSub) PSubscribe(ctx context.Context, patterns ...string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -217,24 +206,9 @@ func (c *PubSub) PSubscribe(ctx context.Context, patterns ...string) error {
 	return err
 }
 
-// SSubscribe Subscribes the client to the specified shard channels.
-func (c *PubSub) SSubscribe(ctx context.Context, channels ...string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	err := c.subscribe(ctx, "ssubscribe", channels...)
-	if c.schannels == nil {
-		c.schannels = make(map[string]struct{})
-	}
-	for _, s := range channels {
-		c.schannels[s] = struct{}{}
-	}
-	return err
-}
-
 // Unsubscribe the client from the given channels, or from all of
 // them if none is given.
-func (c *PubSub) Unsubscribe(ctx context.Context, channels ...string) error {
+func (c *ProxyPubSub) Unsubscribe(ctx context.Context, channels ...string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -255,7 +229,7 @@ func (c *PubSub) Unsubscribe(ctx context.Context, channels ...string) error {
 
 // PUnsubscribe the client from the given patterns, or from all of
 // them if none is given.
-func (c *PubSub) PUnsubscribe(ctx context.Context, patterns ...string) error {
+func (c *ProxyPubSub) PUnsubscribe(ctx context.Context, patterns ...string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -274,39 +248,29 @@ func (c *PubSub) PUnsubscribe(ctx context.Context, patterns ...string) error {
 	return err
 }
 
-// SUnsubscribe unsubscribes the client from the given shard channels,
-// or from all of them if none is given.
-func (c *PubSub) SUnsubscribe(ctx context.Context, channels ...string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if len(channels) > 0 {
-		for _, channel := range channels {
-			delete(c.schannels, channel)
-		}
-	} else {
-		// Unsubscribe from all channels.
-		for channel := range c.schannels {
-			delete(c.schannels, channel)
-		}
-	}
-
-	err := c.subscribe(ctx, "sunsubscribe", channels...)
-	return err
-}
-
-func (c *PubSub) subscribe(ctx context.Context, redisCmd string, channels ...string) error {
-	cn, err := c.conn(ctx, channels)
+func (c *ProxyPubSub) subscribe(ctx context.Context, redisCmd string, channels ...string) error {
+	cns, err := c.conn(ctx, channels)
 	if err != nil {
 		return err
 	}
 
-	err = c._subscribe(ctx, cn, redisCmd, channels)
-	c.releaseConn(ctx, cn, err, false)
-	return err
+	eg, ctx := errgroup.WithContext(ctx)
+	for _, cn := range cns {
+		localCn := cn
+		eg.Go(func() error {
+			fmt.Printf("conn:%s sub:%v\n", localCn.RemoteAddr(), channels)
+			return c._subscribe(ctx, localCn, redisCmd, channels)
+		})
+	}
+
+	if err = eg.Wait(); err != nil {
+		return err
+	}
+	return nil
 }
 
-func (c *PubSub) Ping(ctx context.Context, payload ...string) error {
+// Ping will ping all proxy instance
+func (c *ProxyPubSub) Ping(ctx context.Context, payload ...string) error {
 	args := []interface{}{"ping"}
 	if len(payload) == 1 {
 		args = append(args, payload[0])
@@ -316,55 +280,21 @@ func (c *PubSub) Ping(ctx context.Context, payload ...string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	cn, err := c.conn(ctx, nil)
+	cns, err := c.conn(ctx, nil)
 	if err != nil {
 		return err
 	}
 
-	err = c.writeCmd(ctx, cn, cmd)
-	c.releaseConn(ctx, cn, err, false)
+	for _, cn := range cns {
+		if err = c.writeCmd(ctx, cn, cmd); err != nil {
+			return err
+		}
+	}
+
 	return err
 }
 
-// Subscription received after a successful subscription to channel.
-type Subscription struct {
-	// Can be "subscribe", "unsubscribe", "psubscribe" or "punsubscribe".
-	Kind string
-	// Channel name we have subscribed to.
-	Channel string
-	// Number of channels we are currently subscribed to.
-	Count int
-}
-
-func (m *Subscription) String() string {
-	return fmt.Sprintf("%s: %s", m.Kind, m.Channel)
-}
-
-// Message received as result of a PUBLISH command issued by another client.
-type Message struct {
-	Channel      string
-	Pattern      string
-	Payload      string
-	PayloadSlice []string
-}
-
-func (m *Message) String() string {
-	return fmt.Sprintf("Message<%s: %s>", m.Channel, m.Payload)
-}
-
-// Pong received as result of a PING command issued by another client.
-type Pong struct {
-	Payload string
-}
-
-func (p *Pong) String() string {
-	if p.Payload != "" {
-		return fmt.Sprintf("Pong<%s>", p.Payload)
-	}
-	return "Pong"
-}
-
-func (c *PubSub) newMessage(reply interface{}) (interface{}, error) {
+func (c *ProxyPubSub) newMessage(reply interface{}) (interface{}, error) {
 	switch reply := reply.(type) {
 	case string:
 		return &Pong{
@@ -420,42 +350,92 @@ func (c *PubSub) newMessage(reply interface{}) (interface{}, error) {
 // ReceiveTimeout acts like Receive but returns an error if message
 // is not received in time. This is low-level API and in most cases
 // Channel should be used instead.
-func (c *PubSub) ReceiveTimeout(ctx context.Context, timeout time.Duration) (interface{}, error) {
+func (c *ProxyPubSub) ReceiveTimeout(ctx context.Context, timeout time.Duration) (interface{}, error) {
 	if c.cmd == nil {
 		c.cmd = NewCmd(ctx)
 	}
 
-	// Don't hold the lock to allow subscriptions and pings.
-
-	cn, err := c.connWithLock(ctx)
+	conns, err := c.connWithLock(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	err = cn.WithReader(context.Background(), timeout, func(rd *proto.Reader) error {
-		return c.cmd.readReply(rd)
-	})
+	for addr, cn := range conns {
+		if _, exist := c.inSubscribe[cn]; !exist {
+			c.inSubscribe[cn] = struct{}{}
+			localAddr, localCn := addr, cn
+			go func() {
+				internal.Logger.Printf(ctx, "create goroutine for subscribe proxy:%s\n", localAddr)
 
-	c.releaseConnWithLock(ctx, cn, err, timeout > 0)
+				t := timeout / 2
+				if t <= 0 {
+					t = 1 * time.Second
+				}
 
-	if err != nil {
-		return nil, err
+				for {
+					select {
+					case _, ok := <-c.exit:
+						if !ok {
+							delete(c.inSubscribe, localCn)
+							internal.Logger.Printf(ctx, "exit subscribe goroutine of proxy:%s\n", localAddr)
+							return
+						}
+					default:
+						// 一定要设置timeout, 让goroutine有机会退出
+						if err = localCn.WithReader(context.Background(), t, func(rd *proto.Reader) error {
+							v, err := rd.ReadReply()
+							if v != nil {
+								c.cmd.val = v
+								c.notifyCh <- struct{}{}
+							}
+							return err
+						}); err != nil {
+							// 忽略内部的超时
+							if e, ok := err.(*net.OpError); !(ok && e.Timeout()) {
+								c.notifyCh <- err
+							}
+						}
+					}
+				}
+			}()
+		}
 	}
 
+	// 超时不会断开连接
+	// 模拟超时逻辑
+	var received interface{}
+	if timeout > 0 {
+		for {
+			select {
+			case received = <-c.notifyCh:
+				goto EXIT
+			case <-time.After(timeout):
+				received = errors.New("subscribe timeout")
+				goto EXIT
+			}
+		}
+	} else {
+		received = <-c.notifyCh
+	}
+
+EXIT:
+	if _, ok := received.(error); ok {
+		return nil, err
+	}
 	return c.newMessage(c.cmd.Val())
 }
 
 // Receive returns a message as a Subscription, Message, Pong or error.
 // See PubSub example for details. This is low-level API and in most cases
 // Channel should be used instead.
-func (c *PubSub) Receive(ctx context.Context) (interface{}, error) {
+func (c *ProxyPubSub) Receive(ctx context.Context) (interface{}, error) {
 	return c.ReceiveTimeout(ctx, 0)
 }
 
 // ReceiveMessage returns a Message or error ignoring Subscription and Pong
 // messages. This is low-level API and in most cases Channel should be used
 // instead.
-func (c *PubSub) ReceiveMessage(ctx context.Context) (*Message, error) {
+func (c *ProxyPubSub) ReceiveMessage(ctx context.Context) (*Message, error) {
 	for {
 		msg, err := c.Receive(ctx)
 		if err != nil {
@@ -476,7 +456,7 @@ func (c *PubSub) ReceiveMessage(ctx context.Context) (*Message, error) {
 	}
 }
 
-func (c *PubSub) getContext() context.Context {
+func (c *ProxyPubSub) getContext() context.Context {
 	if c.cmd != nil {
 		return c.cmd.ctx
 	}
@@ -486,16 +466,16 @@ func (c *PubSub) getContext() context.Context {
 //------------------------------------------------------------------------------
 
 // Channel returns a Go channel for concurrently receiving messages.
-// The channel is closed together with the PubSub. If the Go channel
+// The channel is closed together with the ProxyPubSub. If the Go channel
 // is blocked full for 30 seconds the message is dropped.
 // Receive* APIs can not be used after channel is created.
 //
 // go-redis periodically sends ping messages to test connection health
 // and re-subscribes if ping can not not received for 30 seconds.
-func (c *PubSub) Channel(opts ...ChannelOption) <-chan *Message {
+func (c *ProxyPubSub) Channel(opts ...ChannelOption) <-chan *Message {
 	c.chOnce.Do(func() {
-		c.msgCh = newChannel(c, opts...)
-		c.msgCh.initMsgChan()
+		c.msgCh = newProxyChannel(c, opts...)
+		c.msgCh.initMsgChanProxy()
 	})
 	if c.msgCh == nil {
 		err := fmt.Errorf("redis: Channel can't be called after ChannelWithSubscriptions")
@@ -508,7 +488,7 @@ func (c *PubSub) Channel(opts ...ChannelOption) <-chan *Message {
 // with specified buffer size.
 //
 // Deprecated: use Channel(WithChannelSize(size)), remove in v9.
-func (c *PubSub) ChannelSize(size int) <-chan *Message {
+func (c *ProxyPubSub) ChannelSize(size int) <-chan *Message {
 	return c.Channel(WithChannelSize(size))
 }
 
@@ -517,10 +497,10 @@ func (c *PubSub) ChannelSize(size int) <-chan *Message {
 // reconnections.
 //
 // ChannelWithSubscriptions can not be used together with Channel or ChannelSize.
-func (c *PubSub) ChannelWithSubscriptions(opts ...ChannelOption) <-chan interface{} {
+func (c *ProxyPubSub) ChannelWithSubscriptions(opts ...ChannelOption) <-chan interface{} {
 	c.chOnce.Do(func() {
-		c.allCh = newChannel(c, opts...)
-		c.allCh.initAllChan()
+		c.allCh = newProxyChannel(c, opts...)
+		c.allCh.initAllChanProxy()
 	})
 	if c.allCh == nil {
 		err := fmt.Errorf("redis: ChannelWithSubscriptions can't be called after Channel")
@@ -529,54 +509,9 @@ func (c *PubSub) ChannelWithSubscriptions(opts ...ChannelOption) <-chan interfac
 	return c.allCh.allCh
 }
 
-type ChannelOption func(c *channel)
-
-// WithChannelSize specifies the Go chan size that is used to buffer incoming messages.
-//
-// The default is 100 messages.
-func WithChannelSize(size int) ChannelOption {
-	return func(c *channel) {
-		c.chanSize = size
-	}
-}
-
-// WithChannelHealthCheckInterval specifies the health check interval.
-// PubSub will ping Redis Server if it does not receive any messages within the interval.
-// To disable health check, use zero interval.
-//
-// The default is 3 seconds.
-func WithChannelHealthCheckInterval(d time.Duration) ChannelOption {
-	return func(c *channel) {
-		c.checkInterval = d
-	}
-}
-
-// WithChannelSendTimeout specifies the channel send timeout after which
-// the message is dropped.
-//
-// The default is 60 seconds.
-func WithChannelSendTimeout(d time.Duration) ChannelOption {
-	return func(c *channel) {
-		c.chanSendTimeout = d
-	}
-}
-
-type channel struct {
-	pubSub *PubSub
-	proxyPubSub *ProxyPubSub
-
-	msgCh chan *Message
-	allCh chan interface{}
-	ping  chan struct{}
-
-	chanSize        int
-	chanSendTimeout time.Duration
-	checkInterval   time.Duration
-}
-
-func newChannel(pubSub *PubSub, opts ...ChannelOption) *channel {
+func newProxyChannel(proxyPubSub *ProxyPubSub, opts ...ChannelOption) *channel {
 	c := &channel{
-		pubSub: pubSub,
+		proxyPubSub: proxyPubSub,
 
 		chanSize:        100,
 		chanSendTimeout: time.Minute,
@@ -586,41 +521,13 @@ func newChannel(pubSub *PubSub, opts ...ChannelOption) *channel {
 		opt(c)
 	}
 	if c.checkInterval > 0 {
-		c.initHealthCheck()
+		c.initHealthCheckProxy()
 	}
 	return c
 }
 
-func (c *channel) initHealthCheck() {
-	ctx := context.TODO()
-	c.ping = make(chan struct{}, 1)
-
-	go func() {
-		timer := time.NewTimer(time.Minute)
-		timer.Stop()
-
-		for {
-			timer.Reset(c.checkInterval)
-			select {
-			case <-c.ping:
-				if !timer.Stop() {
-					<-timer.C
-				}
-			case <-timer.C:
-				if pingErr := c.pubSub.Ping(ctx); pingErr != nil {
-					c.pubSub.mu.Lock()
-					c.pubSub.reconnect(ctx, pingErr)
-					c.pubSub.mu.Unlock()
-				}
-			case <-c.pubSub.exit:
-				return
-			}
-		}
-	}()
-}
-
 // initMsgChan must be in sync with initAllChan.
-func (c *channel) initMsgChan() {
+func (c *channel) initMsgChanProxy() {
 	ctx := context.TODO()
 	c.msgCh = make(chan *Message, c.chanSize)
 
@@ -630,7 +537,7 @@ func (c *channel) initMsgChan() {
 
 		var errCount int
 		for {
-			msg, err := c.pubSub.Receive(ctx)
+			msg, err := c.proxyPubSub.Receive(ctx)
 			if err != nil {
 				if err == pool.ErrClosed {
 					close(c.msgCh)
@@ -675,8 +582,7 @@ func (c *channel) initMsgChan() {
 	}()
 }
 
-// initAllChan must be in sync with initMsgChan.
-func (c *channel) initAllChan() {
+func (c *channel) initAllChanProxy() {
 	ctx := context.TODO()
 	c.allCh = make(chan interface{}, c.chanSize)
 
@@ -686,7 +592,7 @@ func (c *channel) initAllChan() {
 
 		var errCount int
 		for {
-			msg, err := c.pubSub.Receive(ctx)
+			msg, err := c.proxyPubSub.Receive(ctx)
 			if err != nil {
 				if err == pool.ErrClosed {
 					close(c.allCh)
@@ -727,4 +633,37 @@ func (c *channel) initAllChan() {
 			}
 		}
 	}()
+}
+
+func (c *channel) initHealthCheckProxy() {
+	ctx := context.TODO()
+	c.ping = make(chan struct{}, 1)
+
+	go func() {
+		timer := time.NewTimer(time.Minute)
+		timer.Stop()
+
+		for {
+			timer.Reset(c.checkInterval)
+			select {
+			case <-c.ping:
+				if !timer.Stop() {
+					<-timer.C
+				}
+			case <-timer.C:
+				if pingErr := c.proxyPubSub.Ping(ctx); pingErr != nil {
+					c.proxyPubSub.mu.Lock()
+					c.proxyPubSub.reconnect(ctx, pingErr)
+					c.proxyPubSub.mu.Unlock()
+				}
+			case <-c.proxyPubSub.exit:
+				return
+			}
+		}
+	}()
+}
+
+func (c *ProxyPubSub) reconnect(ctx context.Context, reason error) {
+	_ = c.closeTheCn(reason)
+	_, _ = c.conn(ctx, nil)
 }

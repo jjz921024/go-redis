@@ -2,3 +2,6 @@
 testdata/*
 .idea/
 .DS_Store
+
+example/common/*
+.vscode/*
