@@ -50,6 +50,8 @@ type Options struct {
 	ObserverDisable bool
 	InitServers     []string
 
+	ReadOnlyEnable bool
+
 	// The network type, either tcp or unix.
 	// Default is tcp.
 	Network string

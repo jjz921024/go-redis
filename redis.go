@@ -20,6 +20,11 @@ type Scanner = hscan.Scanner
 // Nil reply returned by Redis when key does not exist.
 const Nil = proto.Nil
 
+const (
+	REDIS_READ_ONLY = "redis-read-only"
+	REDIS_STORAGE_TYPE = "redis-storage-type"
+)
+
 // SetLogger set custom log
 func SetLogger(logger internal.Logging) {
 	internal.Logger = logger
@@ -185,6 +190,7 @@ func (hs *hooksMixin) processTxPipelineHook(ctx context.Context, cmds []Cmder) e
 type baseClient struct {
 	opt      *Options
 	connPool pool.Pooler
+	slaveConnPool pool.Pooler
 
 	onClose func() error // hook called when client is closed
 
@@ -217,7 +223,7 @@ func (c *baseClient) newConn(ctx context.Context) (*pool.Conn, error) {
 		return nil, err
 	}
 
-	err = c.initConn(ctx, cn)
+	err = c.initConn(ctx, cn, false)
 	if err != nil {
 		_ = c.connPool.CloseConn(cn)
 		return nil, err
@@ -246,7 +252,19 @@ func (c *baseClient) getConn(ctx context.Context) (*pool.Conn, error) {
 }
 
 func (c *baseClient) _getConn(ctx context.Context) (*pool.Conn, error) {
-	cn, err := c.connPool.Get(ctx)
+	var isReadOnly bool
+	if readOnly := ctx.Value(REDIS_READ_ONLY); readOnly != nil {
+		isReadOnly = true
+	}
+
+	var pool pool.Pooler
+	if isReadOnly {
+		pool = c.slaveConnPool
+	} else {
+		pool = c.connPool
+	}
+
+	cn, err := pool.Get(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -255,8 +273,8 @@ func (c *baseClient) _getConn(ctx context.Context) (*pool.Conn, error) {
 		return cn, nil
 	}
 
-	if err := c.initConn(ctx, cn); err != nil {
-		c.connPool.Remove(ctx, cn, err)
+	if err := c.initConn(ctx, cn, isReadOnly); err != nil {
+		pool.Remove(ctx, cn, err)
 		if err := errors.Unwrap(err); err != nil {
 			return nil, err
 		}
@@ -266,7 +284,7 @@ func (c *baseClient) _getConn(ctx context.Context) (*pool.Conn, error) {
 	return cn, nil
 }
 
-func (c *baseClient) initConn(ctx context.Context, cn *pool.Conn) error {
+func (c *baseClient) initConn(ctx context.Context, cn *pool.Conn, isReadOnly bool) error {
 	if cn.Inited {
 		return nil
 	}
@@ -277,8 +295,18 @@ func (c *baseClient) initConn(ctx context.Context, cn *pool.Conn) error {
 		username, password = c.opt.CredentialsProvider()
 	}
 
-	connPool := pool.NewSingleConnPool(c.connPool, cn)
-	conn := newConn(c.opt, connPool)
+	if isReadOnly && c.slaveConnPool == nil {
+		return errors.New("opt.ReadOnlyEnable must be set to true, if want to read from replica node")
+	}
+
+	var connPool *pool.SingleConnPool
+	if isReadOnly {
+		connPool = pool.NewSingleConnPool(c.slaveConnPool, cn)
+	} else {
+		connPool = pool.NewSingleConnPool(c.connPool, cn)
+	}
+
+	conn := newConn(c.opt, connPool, isReadOnly)
 
 	var auth bool
 	protocol := c.opt.Protocol
@@ -323,6 +351,10 @@ func (c *baseClient) initConn(ctx context.Context, cn *pool.Conn) error {
 			pipe.ClientSetName(ctx, c.opt.ClientName)
 		}
 
+		if isReadOnly {
+			pipe.ReadOnly(ctx)
+		}
+
 		return nil
 	})
 	if err != nil {
@@ -340,10 +372,17 @@ func (c *baseClient) releaseConn(ctx context.Context, cn *pool.Conn, err error) 
 		c.opt.Limiter.ReportResult(err)
 	}
 
-	if (ob != nil && shouldBeEvict(cn, ob.currentProxy)) || isBadConn(err, false, c.opt.Addr) {
-		c.connPool.Remove(ctx, cn, err)
+	var connPool pool.Pooler
+	if readOnly := ctx.Value(REDIS_READ_ONLY); readOnly != nil {
+		connPool = c.slaveConnPool
 	} else {
-		c.connPool.Put(ctx, cn)
+		connPool = c.connPool
+	}
+
+	if (ob != nil && shouldBeEvict(cn, ob.currentProxy)) || isBadConn(err, false, c.opt.Addr) {
+		connPool.Remove(ctx, cn, err)
+	} else {
+		connPool.Put(ctx, cn)
 	}
 }
 
@@ -446,6 +485,11 @@ func (c *baseClient) Close() error {
 	}
 	if err := c.connPool.Close(); err != nil && firstErr == nil {
 		firstErr = err
+	}
+	if c.slaveConnPool != nil {
+		if err := c.slaveConnPool.Close(); err != nil {
+			internal.Logger.Printf(context.TODO(), "close slave err:%s\n", err.Error())
+		}
 	}
 	if ob != nil {
 		ob.close()
@@ -648,10 +692,17 @@ func NewProxyClient(opt *Options) (*Client, error) {
 
 	if opt.ObserverDisable {
 		c.connPool = newConnPoolFromInitServer(opt, opt.InitServers, c.dialHook)
+		if opt.ReadOnlyEnable {
+			c.slaveConnPool = newConnPoolFromInitServer(opt, opt.InitServers, c.dialHook)
+		}
 	} else {
-		c.connPool = newConnPoolFromObserver(opt, observer, c.dialHook)
 		t := time.NewTicker(20 * time.Second)
+		c.connPool = newConnPoolFromObserver(opt, observer, c.dialHook)
 		go startEvictInvaildConn(t, c.connPool, c.closeCh)
+		if opt.ReadOnlyEnable {
+			c.slaveConnPool = newConnPoolFromObserver(opt, observer, c.dialHook)
+			go startEvictInvaildConn(t, c.slaveConnPool, c.closeCh)
+		}
 	}
 
 	return &c, nil
@@ -702,7 +753,7 @@ func (c *Client) WithTimeout(timeout time.Duration) *Client {
 }
 
 func (c *Client) Conn() *Conn {
-	return newConn(c.opt, pool.NewStickyConnPool(c.connPool))
+	return newConn(c.opt, pool.NewStickyConnPool(c.connPool), false)
 }
 
 // Do create a Cmd from the args and processes the cmd.
@@ -782,7 +833,7 @@ func (c *Client) proxyPubSub() *ProxyPubSub {
 				return nil, errors.New("fail subscribe proxy addr:" + addr)
 			}
 			cn := pool.NewConn(netConn)
-			err = c.initConn(ctx, cn)
+			err = c.initConn(ctx, cn, false)
 			if err != nil {
 				return nil, errors.New("fail init subscribe conn, err:" + err.Error())
 			}
@@ -880,12 +931,17 @@ type Conn struct {
 	hooksMixin
 }
 
-func newConn(opt *Options, connPool pool.Pooler) *Conn {
+func newConn(opt *Options, connPool pool.Pooler, isReadOnly bool) *Conn {
 	c := Conn{
 		baseClient: baseClient{
 			opt:      opt,
-			connPool: connPool,
 		},
+	}
+
+	if isReadOnly {
+		c.slaveConnPool = connPool
+	} else {
+		c.connPool = connPool
 	}
 
 	c.cmdable = c.Process
