@@ -20,9 +20,12 @@ type Scanner = hscan.Scanner
 // Nil reply returned by Redis when key does not exist.
 const Nil = proto.Nil
 
-const (
-	REDIS_READ_ONLY = "redis-read-only"
-	REDIS_STORAGE_TYPE = "redis-storage-type"
+type readOnlyCtxKey struct{}
+type storageTypeCtxKey struct{}
+
+var (
+	roCtxKey = readOnlyCtxKey{}
+	stCtxKey = storageTypeCtxKey{}
 )
 
 // SetLogger set custom log
@@ -253,7 +256,7 @@ func (c *baseClient) getConn(ctx context.Context) (*pool.Conn, error) {
 
 func (c *baseClient) _getConn(ctx context.Context) (*pool.Conn, error) {
 	var isReadOnly bool
-	if readOnly := ctx.Value(REDIS_READ_ONLY); readOnly != nil {
+	if readOnly := ctx.Value(roCtxKey); readOnly != nil {
 		isReadOnly = true
 	}
 
@@ -373,7 +376,7 @@ func (c *baseClient) releaseConn(ctx context.Context, cn *pool.Conn, err error) 
 	}
 
 	var connPool pool.Pooler
-	if readOnly := ctx.Value(REDIS_READ_ONLY); readOnly != nil {
+	if readOnly := ctx.Value(roCtxKey); readOnly != nil {
 		connPool = c.slaveConnPool
 	} else {
 		connPool = c.connPool
@@ -988,4 +991,8 @@ func (c *Conn) TxPipeline() Pipeliner {
 	}
 	pipe.init()
 	return &pipe
+}
+
+func WithReadOnlyContext(ctx context.Context) context.Context {
+	return context.WithValue(ctx, roCtxKey, struct{}{})
 }

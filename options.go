@@ -225,6 +225,14 @@ func (opt *Options) init() {
 	case 0:
 		opt.MaxRetryBackoff = 512 * time.Millisecond
 	}
+
+	if opt.MaxIdleConns > 32 || opt.MaxIdleConns == 0 {
+		internal.Logger.Printf(context.TODO(), "MaxIdleConns:%d is incorrect, please confirm the settings are really needed", opt.MaxIdleConns)
+	}
+
+	if opt.MinIdleConns > 32 || opt.MinIdleConns == 0 {
+		internal.Logger.Printf(context.TODO(), "MinIdleConns:%d is incorrect, please confirm the settings are really needed", opt.MinIdleConns)
+	}
 }
 
 func (opt *Options) clone() *Options {
